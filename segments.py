@@ -185,10 +185,6 @@ class AutoPhrase:
           h[j] = h[i] + sum_log_p
           g[j] = i
 
-    with open('output-H.txt', 'w') as fw:
-      for k, v in h.items():
-        fw.write('{} {}\n'.format(k, v))
-
     j = len(self.C) + 1
     m = 0
     b = {}
