@@ -125,6 +125,10 @@ class AutoPhrase:
     self._param_delta = param_delta
     self._param_theta = param_theta
 
+  def viterbi(self):
+    """维特比算法"""
+    pass
+
   def PGPS(self, length_threshold):
     """
     Algorithm 1: POS-Guided Phrasal Segmentation (PGPS)
@@ -484,10 +488,9 @@ def tokenize(strings):
 
 if __name__ == '__main__':
   # test AutoPhrase.PGPS
-  # fname_corpus = 'C:\\Users\\芳芳和我\\corpus\\汽车行业\\汽车品牌新闻_v3_20180209\\新能源\\test.xlsx'
-  fname_corpus = 'E:\\corpus\\汽车行业\\汽车品牌新闻_v3_20180209\\新能源\\test.xlsx'
+  fname_corpus = 'data/test.xlsx'
   corpus = Corpus(fname_corpus)
-  quality = Quality('data/多词词组自动抽取结果（新能源领域2017年新闻挖掘）.xlsx')
+  quality = Quality('data/QualityPhrase（新能源2017年）.xlsx')
   omega = Omega(corpus)
   ap = AutoPhrase(omega=omega, quality=quality)
   ap.init_parameters(length_threshold=6, memory_size_mb=128)
@@ -497,34 +500,15 @@ if __name__ == '__main__':
     for i in res:
       fw.write('{}\n'.format(i))
 
-  # # test AutoPhrase.yield_start_and_end_index
-  # corpus = Corpus('C:\\Users\\芳芳和我\\corpus\\汽车行业\\汽车品牌新闻_v3_20180209\\新能源\\test.xlsx')
-  # quality = Quality('data/多词词组自动抽取结果（新能源领域2017年新闻挖掘）.xlsx')
-  # omega = Omega(corpus)
-  # ap = AutoPhrase(omega=omega, quality=quality)
-  # for i, j in ap.yield_start_and_end_index(length_threshold=6):
-  #   print(i, j)
-
   # # test Ngram
-  # fname = 'C:\\Users\\芳芳和我\\corpus\\汽车行业\\汽车品牌新闻_v3_20180209\\新能源\\test.xlsx'
-  # corpus = Corpus(fname)
+  # corpus = Corpus('data/test.xlsx')
   # bigram = Ngram(corpus, n=2, ignore_unigram=True)
   # for i in bigram:
   #   print(i)
   #
-  # # test BiGramCounter
-  # fname = 'C:\\Users\\芳芳和我\\corpus\\汽车行业\\汽车品牌新闻_v3_20180209\\新能源\\test.xlsx'
-  # corpus = Corpus(fname)
-  # count_bigram = BiGramCounter(corpus)
-  # count_bigram.train(memory_size_mb=512)
-  # sum_count_T = sum(v for k, v in count_bigram.count_T.items())
-  # sum_count_W = sum(v for k, v in count_bigram.count_W.items())
-  # assert sum_count_T == sum_count_W
-  #
   #
   # # test Quality implemented by trie tree
-  # fname = 'data/多词词组自动抽取结果（新能源领域2017年新闻挖掘）.xlsx'
-  # trie = Quality(fname)
+  # trie = Quality('data/QualityPhrase（新能源2017年）.xlsx')
   # # assert '插 电 式 混合' in trie
   # # assert '插 电 式 混合 动力 城市' in trie
   # # assert '插 电 式 混合 动' not in trie
@@ -535,8 +519,7 @@ if __name__ == '__main__':
   #
   #
   # # test Omega
-  # fname = 'C:\\Users\\芳芳和我\\corpus\\汽车行业\\汽车品牌新闻_v3_20180209\\新能源\\test.xlsx'
-  # corpus = Corpus(fname)
+  # corpus = Corpus('data/test.xlsx')
   # omega = Omega(corpus)
   # assert omega.word(0, 15) == ' '.join(t.word for t in omega[:15])
   # assert omega.tag(0, 15) == ' '.join(t.tag for t in omega[:15])
