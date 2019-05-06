@@ -3,8 +3,6 @@ from __future__ import division
 from __future__ import absolute_import
 from __future__ import generator_stop
 
-from itertools import islice
-from itertools import chain
 from collections import namedtuple
 from abc import ABC, abstractmethod
 
@@ -14,8 +12,6 @@ except ImportError:
   Mapping = dict
 
 from math import log
-import re
-import os
 import tqdm
 
 import bounter
@@ -23,6 +19,12 @@ import pandas as pd
 import numpy as np
 from sklearn import tree
 import jieba
+from pyhanlp import HanLP
+
+from utils import ngram
+from utils import preprocess
+from utils import one_token_a_line
+from utils import split_iter
 
 import logging
 
@@ -59,7 +61,7 @@ class Rank:
       self._ignore_words.update(train_words)
     return
   
-  def avg_predict_proba(self, threshold=0.5):
+  def avg_predict_proba(self):
     if self.forest is None:
       raise ValueError('attribute "forest" has not init.')
     
@@ -75,16 +77,15 @@ class Rank:
       average_scores = arr.mean(axis=0)
       neg_to_predict = neg_to_predict.assign(scores=average_scores)
       proba_res = neg_to_predict[['candidate', 'scores']]
-      proba_res = proba_res.loc[proba_res['scores'] > threshold]
       proba_res.sort_values('scores', ascending=False, inplace=True)
       
       proba_res['check'] = proba_res['candidate'].apply(
         lambda s: any(sub in s for sub in self.stopwords))
       proba_res['length'] = proba_res['candidate'].apply(
         lambda s: s.count(' ') + 1)
-      
-      proba_res = proba_res.loc[proba_res['length'] > 1]
+
       proba_res = proba_res.loc[proba_res['check'] == False]
+      del proba_res['check']
       
       return proba_res
   
@@ -283,7 +284,8 @@ class Sentences:
     for sent in split_iter(normed_sent, self.eos_placement):
       sent = ''.join(sent)
       if sent:
-        yield list(jieba.cut(sent))
+        yield list(term.word for term in HanLP.segment(sent))
+        # yield list(jieba.cut(sent))
 
 
 class Corpus(ABC):
@@ -295,79 +297,6 @@ class Corpus(ABC):
   @abstractmethod
   def __iter__(self) -> Sentences:
     pass
-
-
-def _takewhile(predicate, iterator, has_data):
-  """
-  Return successive entries from an iterable as long as the
-  predicate evaluates to true for each entry.
-
-  has_data outputs if the iterator has been consumed in the process.
-  """
-  for item in iterator:
-    if predicate(item):
-      yield item
-    else:
-      break
-  else:
-    has_data[0] = False
-
-
-def isplit(iterator, value):
-  """Return a lazy generator of items in an iterator, seperating by value."""
-  iterator = iter(iterator)
-  has_data = [True]
-  while has_data[0]:
-    yield _takewhile(value.__ne__, iterator, has_data)
-
-
-def split_iter(iterator, sep):
-  """Return a semi-lazy generator of items in an iterator, seperating by value."""
-  iterator = iter(iterator)
-  has_data = [True]
-  while True:
-    carry = []
-    d = _takewhile(sep.__ne__, iterator, has_data)
-    try:
-      first = next(d)
-    except StopIteration:
-      if not has_data[0]:
-        break
-      yield iter([])
-    else:
-      yield chain([first], d, carry)
-      carry.extend(d)
-
-
-def preprocess(strings, word_splitter=' ',
-               ignore_punc=True, eos_placement='※'):
-  if not strings:
-    return ''
-  
-  # <OS placement for those punctuations
-  EOS_PLACEMENT = set("""。 ， ！ ？ ! ? ; ； : ： … . , " '""".split())
-  # entire punctuations including both unicode and ascii series
-  PUNCTUATION = one_token_a_line(fname='punctuations.txt') - EOS_PLACEMENT
-  # punctuation escaped for regex
-  punc_escape = '\\'.join(PUNCTUATION)
-  eos_escape = '\\'.join(EOS_PLACEMENT)
-  
-  # lower ascii letters
-  new_strings = strings.lower()
-  # remove punctuation
-  new_strings = re.sub(r'[{}]+'.format(punc_escape), word_splitter, new_strings)
-  new_strings = re.sub(r'[\u3000 ]+', word_splitter, new_strings, flags=re.U)
-  # insert <EOS>
-  new_strings = re.sub(r'[{}]+'.format(eos_escape), eos_placement, new_strings)
-  new_strings = new_strings.replace('\n', eos_placement)
-  # remove extra whitespace
-  new_strings = re.sub(r'[\r\t]+', word_splitter, new_strings)
-  new_strings = re.sub(r' +', word_splitter, new_strings)
-  if ignore_punc:
-    new_strings = new_strings.replace(word_splitter, r'')
-  new_strings = new_strings.strip()
-  
-  return new_strings
 
 
 def compute_pmi(token, count_T, epsilon=1e-5):
@@ -407,27 +336,4 @@ def compute_idf(ngram_num_doc, total_num_doc):
   idf_val = log(sum([1, total_num_doc]) / sum((1, ngram_num_doc)))
   return idf_val
 
-
-def ngram(sentence, n):
-  """ngram('ABCD', 3) --> A B C D AB BC CD DE ABC BCD"""
-  # TODO: 某些业务需要将数值归一化成替换符号“<NUM>”，请加参数控制这一行为
-  if not isinstance(sentence, list):
-    raise TypeError('argument sentence should pass a list '
-                    'object, got {}.'.format(type(sentence)))
-  
-  for n in range(1, n + 1):
-    it = iter(sentence)
-    result = tuple(islice(it, n))
-    if len(result) == n:
-      yield ' '.join(result)
-    for gb in it:
-      result = result[1:] + (gb,)
-      yield ' '.join(result)
-
-
-def one_token_a_line(fname):
-  return set(open(safe_path(fname), 'r', encoding='utf8').read().strip().split('\n'))
-
-
-def safe_path(path):
-  return os.path.normpath(os.path.join(os.path.dirname(__file__), path))
+# TODO：增加词组过滤器 如：'^[还只会再满使约不近占只] *' '(分钟|小时|万元|时许|分钱)'
