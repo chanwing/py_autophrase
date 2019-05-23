@@ -285,7 +285,6 @@ class Sentences:
       sent = ''.join(sent)
       if sent:
         yield list(term.word for term in HanLP.segment(sent))
-        # yield list(jieba.cut(sent))
 
 
 class Corpus(ABC):
