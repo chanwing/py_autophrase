@@ -3,114 +3,110 @@ from __future__ import division
 from __future__ import absolute_import
 from __future__ import generator_stop
 
-import os
-import operator
-import functools
 import itertools
 import collections
 import logging
-import tqdm
-import bounter
+
 import pandas as pd
 import numpy as np
 from scipy.stats import truncnorm
 from pyhanlp import HanLP
-from numpy import ma
+import tqdm
+import bounter
 
 from utils import ngram
 from utils import preprocess
 from utils import split_iter
+from utils import safe_path
 
 logging.basicConfig(format='%(asctime)s : %(message)s',
                     level=logging.DEBUG)
 
 
 class AutoPhrase:
-  FNAME_POSTAG = os.path.normpath(os.path.join(os.path.dirname(__file__), 'tags.txt'))
+  FNAME_POSTAG = safe_path('tags.txt')
 
-  def __init__(self, omega, quality, length_threshold):
+  def __init__(self, omega, quality, length_threshold, memory_size_mb):
     """AutoPhrase
 
     :param omega::Omega
     :param quality::Quality
+    :param length_threshold::int max length of n-grams
     """
     if not isinstance(omega, Omega):
-      err = 'argument "omega" must be Omega, ' \
+      err = 'argument "omega" must be a Omega object, ' \
             'got {}'.format(type(omega))
       raise TypeError(err)
 
     if not isinstance(quality, Quality):
-      err = 'argument "quality" must be Quality, ' \
+      err = 'argument "quality" must be a Quality object, ' \
             'got {}'.format(type(quality))
       raise TypeError(err)
 
     self.length_threshold = length_threshold
+    self.memory_size_mb = memory_size_mb
 
     # 语料库
     self.C = omega
-    # 短语生成模型
+
+    # 短语质量得分
+    # 基于AutoPhrase.features
     self.Q = quality
+
+    # 状态转移概率：
+    # 从上一个pos标签到当前pos标签的出现概率
+    self._param_delta = None
+
+    # 发射概率：
+    # 在确定边界的情况下，生成当前 n-grams组的概率
+    self._param_theta = None
+
+    # 跟踪参数收敛
+    self._trace_delta = list()
+    self._trace_theta = list()
 
     self._delta = None
     self._theta = None
-    self._param_delta = None
-    self._param_theta = None
     self._phrases = None
 
-    self._trace_param_delta = list()
-    self._trace_param_theta = list()
+    # initialize θ with normalized raw frequencies in the corpus
+    self.init_parameters()
 
   @property
   def phrases(self):
     if self._phrases is not None:
       return self._phrases
 
-  @property
-  def delta(self):
-    if self._delta is not None:
-      return self._delta
-
-  @property
-  def theta(self):
-    if self._theta is not None:
-      return self._theta
-
-  @property
-  def param_delta(self):
-    if self._param_delta is not None:
-      return self._param_delta
-
-  @property
-  def param_theta(self):
-    if self._param_theta is not None:
-      return self._param_theta
-
-  def train(self, memory_size_mb):
+  def train(self):
     """
-    基于维特比算法的训练函数
+    基于 Viterbi Training的训练函数，通过前向算法 PGPS
+    对 theta和 delta进行参数估计
 
     Input: Corpus Ω and phrase quality Q.
     Output: θu and δ(tx, ty).
+
+    :return: None
     """
     logging.debug('Viterbi Training.')
 
-    # initialize θ with normalized raw frequencies in the corpus
-    self.init_parameters(memory_size_mb=memory_size_mb)
+    if self._param_delta is None or self._param_theta is None:
+      raise ValueError('Parameter delta and theta is empty. '
+                       'Should initial the parameters first.')
 
-    while decreasing(self._trace_param_theta):
-      while decreasing(self._trace_param_delta):
+    while decreasing(self._trace_theta):
+      while decreasing(self._trace_delta):
         current_B = self.PGPS()
-        self.update_delta(current_B, memory_size_mb)
+        self.update_delta(current_B)
 
       current_B = self.PGPS()
-      self.update_theta(current_B, memory_size_mb)
+      self.update_theta(current_B)
 
     logging.debug('both theta and delta not converge.')
 
-    # 获取纠正质量得分后的短语
+    # 获取纠正后的短语
     phrases = {}
-    for candidate, idx in self.theta.items():
-      phrases[candidate] = self.param_theta[idx]
+    for candidate, idx in self._theta.items():
+      phrases[candidate] = self._param_theta[idx]
     if phrases:
       phrases = pd.Series(phrases).sort_values(ascending=False).reset_index()
       phrases.columns = ['phrase', 'score']
@@ -118,68 +114,63 @@ class AutoPhrase:
 
   def PGPS(self):
     """
-    Algorithm 1: POS-Guided Phrasal Segmentation (PGPS)
+    POS-Guided Phrasal Segmentation (PGPS)
     基于part-of-speech标签的短语分割算法
 
     :return: B::优化后的边界下标序列，每个条目是确定分割短语的边界下标
     """
-    # hi === max_B p(w1t1 ... wntn,B|Q,theta,delta)
-    # default -1e100：在数空间中用这个数代表常数中的零
+    # 设置一个非常大的负数，用它表示无限接近零的小数的对数
     # exp(-1e100) ≈ 0
-
     tiny_log_value = -1e100
 
+    # 计算整体n-gram序列（以短语为单位的观测序列）的出现概率
+    # h 中所有关于概率的计算都将转成对数加法（替代乘法）
     h = collections.defaultdict(lambda: tiny_log_value)
 
-    # 初始化句首边界的概率
-    # 在对数空间中用0.代表常数中的 1
-    # log(1) = 0
+    # 观测序列从句首开始，句首边界100%一定存在，因此概率为1.
+    # 对1.取对数，得 log(1.) = 0.
     h[1] = 0.
 
     # g <- {右边界: 左边界}
     g = {}
 
+    # 通过左右边界下标遍历所有可能出现的n-grams组
     bar = tqdm.tqdm(range(1, len(self.C) + 1), ascii=True)
     for i in bar:
       bar.set_description('PGPS')
 
       for j in range(i + 1, min(i + self.length_threshold + 1,
                                 len(self.C) - 1)):
+
+        # 如果连质量短语都不是，这组 n-grams的出现概率为0
         if not self.Q.startswith(self.C.word(i, j)):
           h[j] = h[i]
           g[j] = i
           break
 
-        # 获取参数
+        # 获取参数：转移概率、发射概率和词频质量得分
         T_values = self.pos_quality_scores(i, j)
         theta_values = self.length_quality_scores(i, j)
         Q_values = self.freq_quality_scores(i, j)
 
-        # 计算右边界下标的出现概率
-        # 概率乘积很容易小到超过正常浮点数的范围，
-        # 用乘法转成对数加法，让计算机能够有效存储的概率乘积
-        # 比较大小时，用log加法替代乘法
-        # log(a)+log(b)+log(c)+log(d) <-- a*b*c*d
-
-        # p(bi+1, dw[bi,bi+1)c|bi, t) =
-        # T(t[bi,bi+1))θw[bi,bi+1)Q(w[bi,bi+1))
-        # p ∈ 实数空间
+        # 计算联合概率
         p = np.append(
-          T_values[:-1],  # 短语pos标签内部概率
-          ((1 - T_values[-1]),  # 短语pos标签外部概率
+          T_values[:-1],  # 短语内部概率
+          ((1 - T_values[-1]),  # 短语外部概率
            theta_values,
            Q_values))
 
-        # 通过 mask 的方法将 log(0) 替换成 -1e100
+        # 用log加法替代乘法计算联合概率
         log_p = np.log(p, out=np.zeros_like(p), where=(p != 0))
-
-        # TODO: 解决 log(零）问题
-        # log_p[log_p == 0] = tiny_log_value
         sum_log_p = log_p.view(np.float64).sum()
 
+        # 计算当前 n-grams组和已出现 n-gram序列的联合概率
+        # 在状态转移概率和发射概率的条件下，获取出现概率最大n-grams的边界
         if h[i] + sum_log_p > h[j]:
           h[j] = h[i] + sum_log_p
           g[j] = i
+
+    # 回溯前向算法找到出现概率最大的右边界下标
 
     j = len(self.C) + 1
     m = 0
@@ -200,13 +191,13 @@ class AutoPhrase:
 
     return B
 
-  def init_parameters(self, memory_size_mb):
+  def init_parameters(self):
     """参数初始化"""
 
     # 1.theta参数初始化
 
     # 遍历所有可能的候选短语，统计词频
-    counter = bounter.bounter(size_mb=memory_size_mb)
+    counter = bounter.bounter(size_mb=self.memory_size_mb)
     for i in range(1, len(self.C) + 1):
       for j in range(i + 1, min(i + self.length_threshold + 1,
                                 len(self.C) - 1)):
@@ -222,7 +213,7 @@ class AutoPhrase:
                      scale=_std)
 
     # θ <- {短语 <- 短语下标}
-    theta = bounter.bounter(size_mb=memory_size_mb)
+    theta = bounter.bounter(size_mb=self.memory_size_mb)
 
     idx_theta = 0  # 从零计数
     for candidate in counter.keys():
@@ -246,22 +237,22 @@ class AutoPhrase:
     self._param_theta = param_theta
 
     # 检查参数收敛情况
-    self._trace_param_delta.append(
-      np.less(param_delta, np.ones(param_delta.size)).astype(int).sum()
+    self._trace_delta.append(
+      compare_arrays(param_delta, np.ones(param_delta.size))
     )
-    self._trace_param_theta.append(
-      np.less(param_theta, np.ones(param_theta.size)).astype(int).sum()
+    self._trace_theta.append(
+      compare_arrays(param_theta, np.ones(param_theta.size))
     )
 
-  def update_theta(self, B, memory_size_mb):
+  def update_theta(self, B):
     assert (isinstance(B, list))
     assert len(B) > 1
 
-    pre_param = self.param_theta
+    pre_param = self._param_theta
 
     m = len(B)
 
-    numerator = bounter.bounter(size_mb=memory_size_mb // 2)
+    numerator = bounter.bounter(size_mb=self.memory_size_mb // 2)
     denominator = collections.defaultdict(int)
 
     bar = tqdm.tqdm(range(m - 1), ascii=True)
@@ -271,8 +262,8 @@ class AutoPhrase:
       numerator.increment(self.C.word(B[i], B[i + 1]))
       denominator[B[i + 1] - B[i]] += 1
 
-    bar = tqdm.tqdm(self.theta.items(),
-                    total=len(self.theta),
+    bar = tqdm.tqdm(self._theta.items(),
+                    total=len(self._theta),
                     ascii=True)
 
     for candidate, idx in bar:
@@ -282,27 +273,27 @@ class AutoPhrase:
         u_len = candidate.count(' ') + 1
 
         new_theta_value = numerator[candidate] / denominator[u_len]
-        self.param_theta[idx] = new_theta_value
+        self._param_theta[idx] = new_theta_value
       else:
-        self.param_theta[idx] = 0.
+        self._param_theta[idx] = 0.
 
-    self._trace_param_theta.append(
-      np.less(self.param_theta, pre_param).astype(int).sum()
+    self._trace_theta.append(
+      compare_arrays(self._param_theta, pre_param)
     )
 
     del pre_param
 
-  def update_delta(self, B, memory_size_mb):
+  def update_delta(self, B):
     assert (isinstance(B, list))
     assert len(B) > 1
 
-    pre_param = self.param_delta
+    pre_param = self._param_delta
 
     m = len(B)
     n = len(self.C)
 
-    TxTy_numerator = bounter.bounter(size_mb=memory_size_mb // 2)
-    TxTy_denominator = bounter.bounter(size_mb=memory_size_mb // 2)
+    TxTy_numerator = bounter.bounter(size_mb=self.memory_size_mb // 2)
+    TxTy_denominator = bounter.bounter(size_mb=self.memory_size_mb // 2)
 
     bar = tqdm.tqdm(range(1, m - 1), ascii=True)
 
@@ -318,8 +309,8 @@ class AutoPhrase:
       bar.set_description('delta 2/3')
       TxTy_denominator.increment(self.C.tag(i, i + 2))
 
-    bar = tqdm.tqdm(self.delta.items(),
-                    total=len(self.delta),
+    bar = tqdm.tqdm(self._delta.items(),
+                    total=len(self._delta),
                     ascii=True)
 
     for txty, idx in bar:
@@ -328,12 +319,12 @@ class AutoPhrase:
       if TxTy_numerator[txty] != 0:
         print(txty)
         new_delta_value = TxTy_numerator[txty] / TxTy_denominator[txty]
-        self.param_delta[idx] = new_delta_value
+        self._param_delta[idx] = new_delta_value
       else:
-        self.param_delta[idx] = 0.
+        self._param_delta[idx] = 0.
 
-    self._trace_param_delta.append(
-      np.less(self.param_delta, pre_param).astype(int).sum()
+    self._trace_delta.append(
+      compare_arrays(self._param_delta, pre_param)
     )
 
     del pre_param
@@ -341,8 +332,8 @@ class AutoPhrase:
   def length_quality_scores(self, start_idx, end_idx):
     """获取指定的 theta[u] 参数"""
     # 初始化时从1开始计数，np.array是从0开始计数，因此 u_idx=idx - 1
-    u_idx = self.theta[self.C.word(start=start_idx, stop=end_idx)]
-    param_val = self.param_theta[u_idx]
+    u_idx = self._theta[self.C.word(start=start_idx, stop=end_idx)]
+    param_val = self._param_theta[u_idx]
     return param_val
 
   def pos_quality_scores(self, start_idx, end_idx):
@@ -370,15 +361,15 @@ class AutoPhrase:
         # 多词词组的情况，遍历内部二元词组和右邻词组
         for k in range(start_idx, end_idx + 1):
           TxTy = self.C.tag(k, k + 2)
-          TxTy_idx = self.delta[TxTy]
-          param_val = self.param_delta[TxTy_idx]
+          TxTy_idx = self._delta[TxTy]
+          param_val = self._param_delta[TxTy_idx]
           delta_param_vals.append(param_val)
       else:
 
         # 单词词组的情况，内部完整性概率为100%
         TxTy = self.C.tag(start_idx, end_idx + 1)
-        TxTy_idx = self.delta[TxTy]
-        param_val = self.param_delta[TxTy_idx]
+        TxTy_idx = self._delta[TxTy]
+        param_val = self._param_delta[TxTy_idx]
         delta_param_vals.append(1.)
         delta_param_vals.append(param_val)
 
@@ -513,7 +504,7 @@ class Ngram:
   Term = collections.namedtuple('Term', 'word tag')
 
   def __init__(self, corpus, n, ignore_unigram):
-    """将语料库转换成N-gram序列"""
+    """corpus -> a sequence of N-gram"""
     self.corpus = corpus
     self.n = n
     self.ignore_unigram = ignore_unigram
@@ -557,7 +548,7 @@ class Corpus:
 class Sentences:
 
   def __init__(self, strings, eos_placement='※'):
-    """将document转换成a sequence of sentence"""
+    """document --> a sequence of sentence"""
     self.strings = strings
     self.eos_placement = eos_placement
 
@@ -577,113 +568,127 @@ def tokenize(strings):
 
 
 def decreasing(seq):
+  """
+  判断序列数值是否收敛
+
+  decreasing(6, 5, 3, 1) return True
+  decreasing(5, 3, 3) return False
+  decreasing(4, 0, 0) return False
+  """
   return all(x > y for x, y in zip(seq, seq[1:]))
 
 
-if __name__ == '__main__':
-  # # test AutoPhrase.train on whole datasets
-  # corpus_instance = Corpus('test.xlsx')
-  # quality_instance = Quality('QualityPhrase（新能源2017年）.xlsx')
-  # omega_instance = Omega(corpus_instance)
-  # ap = AutoPhrase(omega=omega_instance,
-  #                 quality=quality_instance,
-  #                 length_threshold=6)
-  # ap.train(memory_size_mb=10240)
-  # b_list = ap.PGPS()
-  # ipsh()
+def compare_arrays(arr1, arr2):
+  """比较两个np.array的大小（pointwise）
+  返回 arr1数值大于 arr2的总数量"""
+  return np.less(arr1, arr2).astype(int).sum()
 
-  # # test decreasing
-  # seq1 = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
-  # assert (decreasing(seq1) == True)
-  #
-  # seq2 = [9, 8, 7, 6, 5, 4, 3, 3, 3, 3]
-  # assert (decreasing(seq2) == False)
-  #
-  # seq3 = [9, 8, 8]
-  # assert (decreasing(seq3) == False)
 
-  # test AutoPhrase.train
-  fname_corpus = 'data/test.xlsx'
-  corpus_instance = Corpus(fname_corpus)
-  quality_instance = Quality('data/QualityPhrase（新能源2017年）.xlsx')
-  omega_instance = Omega(corpus_instance)
-  ap = AutoPhrase(omega=omega_instance,
-                  quality=quality_instance,
-                  length_threshold=6)
-  ap.train(memory_size_mb=512)
-  b_list = ap.PGPS()
-  ap.phrases.to_excel('res.xlsx', index=False)
-  ipsh()
-  #
-  # with open('output-b_list.txt', 'w') as fw:
-  #   for line in b_list:
-  #     fw.write('{}\n'.format(line))
-
-  # test AutoPhrase.init_parameters
-  # test AutoPhrase.PGPS
-  # test AutoPhrase.update_delta
-  # fname_corpus = 'data/test.xlsx'
-  # corpus_instance = Corpus(fname_corpus)
-  # quality_instance = Quality('data/QualityPhrase（新能源2017年）.xlsx')
-  # omega_instance = Omega(corpus_instance)
-  # ap = AutoPhrase(omega=omega_instance,
-  #                 quality=quality_instance,
-  #                 length_threshold=6)
-  # ap.init_parameters(memory_size_mb=128)
-  # B_lst = ap.PGPS()
-  #
-  # ap.update_delta(B_1st_round, memory_size_mb=128)
-  # B_2nd_round = ap.PGPS()
-  # ap.update_delta(B_2nd_round, memory_size_mb=128)
-  # B_3rd_round = ap.PGPS()
-  #
-  # with open('output-B_lst.txt', 'w') as fw:
-  #   for line in B_lst:
-  #     fw.write('{}\n'.format(line))
-
-  # with open('output-B_2nd_round.txt', 'w') as fw:
-  #   for line in B_2nd_round:
-  #     fw.write('{}\n'.format(line))
-  #
-  # with open('output-B_3rd_round.txt', 'w') as fw:
-  #   for line in B_3rd_round:
-  #     fw.write('{}\n'.format(line))
-
-  # # test AutoPhrase.PGPS
-  # fname_corpus = 'data/test.xlsx'
-  # corpus_instance = Corpus(fname_corpus)
-  # quality_instance = Quality('data/QualityPhrase（新能源2017年）.xlsx')
-  # omega_instance = Omega(corpus_instance)
-  # ap = AutoPhrase(omega=omega_instance,
-  #                 quality=quality_instance,
-  #                 length_threshold=6)
-  # ap.init_parameters(memory_size_mb=128)
-  # res = ap.PGPS()
-  #
-  # with open('output-G.txt', 'w') as fw:
-  #   for line in res:
-  #     fw.write('{}\n'.format(line))
-
-  # # test Ngram
-  # corpus = Corpus('data/test.xlsx')
-  # bigram = Ngram(corpus, n=2, ignore_unigram=True)
-  # for i in bigram:
-  #   print(i)
-  #
-  #
-  # # test Quality implemented by trie tree
-  # trie = Quality('data/QualityPhrase（新能源2017年）.xlsx')
-  # # assert '插 电 式 混合' in trie
-  # # assert '插 电 式 混合 动力 城市' in trie
-  # # assert '插 电 式 混合 动' not in trie
-  # print(trie['插 电 式 混合'])
-  # print(trie['插 电 式 混合 动力 城市'])
-  # print(trie.startswith('插'))
-  # ipsh()
-  #
-  #
-  # # test Omega
-  # corpus = Corpus('data/test.xlsx')
-  # omega = Omega(corpus)
-  # assert omega.word(0, 15) == ' '.join(t.word for t in omega[:15])
-  # assert omega.tag(0, 15) == ' '.join(t.tag for t in omega[:15])
+# if __name__ == '__main__':
+#   # # test AutoPhrase.train on whole datasets
+#   # corpus_instance = Corpus('2017.xlsx')
+#   # quality_instance = Quality('QualityPhrase（新能源2017年）.xlsx')
+#   # omega_instance = Omega(corpus_instance)
+#   # ap = AutoPhrase(omega=omega_instance,
+#   #                 quality=quality_instance,
+#   #                 length_threshold=6)
+#   # ap.train(memory_size_mb=5120)
+#   # b_list = ap.PGPS()
+#   # ipsh()
+#
+#   # # test decreasing
+#   # seq1 = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+#   # assert (decreasing(seq1) == True)
+#   #
+#   # seq2 = [9, 8, 7, 6, 5, 4, 3, 3, 3, 3]
+#   # assert (decreasing(seq2) == False)
+#   #
+#   # seq3 = [9, 8, 8]
+#   # assert (decreasing(seq3) == False)
+#
+#   # # test AutoPhrase.train
+#   # fname_corpus = 'data/test.xlsx'
+#   # corpus_instance = Corpus(fname_corpus)
+#   # quality_instance = Quality('data/QualityPhrase（新能源2017年）.xlsx')
+#   # omega_instance = Omega(corpus_instance)
+#   # ap = AutoPhrase(omega=omega_instance,
+#   #                 quality=quality_instance,
+#   #                 length_threshold=6,
+#   #                 memory_size_mb=512)
+#   # ap.train()
+#   # b_list = ap.PGPS()
+#   # ap.phrases.to_excel('res.xlsx', index=False)
+#   # ipsh()
+#   #
+#   # with open('output-b_list.txt', 'w') as fw:
+#   #   for line in b_list:
+#   #     fw.write('{}\n'.format(line))
+#
+#   # test AutoPhrase.init_parameters
+#   # test AutoPhrase.PGPS
+#   # test AutoPhrase.update_delta
+#   # fname_corpus = 'data/test.xlsx'
+#   # corpus_instance = Corpus(fname_corpus)
+#   # quality_instance = Quality('data/QualityPhrase（新能源2017年）.xlsx')
+#   # omega_instance = Omega(corpus_instance)
+#   # ap = AutoPhrase(omega=omega_instance,
+#   #                 quality=quality_instance,
+#   #                 length_threshold=6)
+#   # ap.init_parameters(memory_size_mb=128)
+#   # B_lst = ap.PGPS()
+#   #
+#   # ap.update_delta(B_1st_round, memory_size_mb=128)
+#   # B_2nd_round = ap.PGPS()
+#   # ap.update_delta(B_2nd_round, memory_size_mb=128)
+#   # B_3rd_round = ap.PGPS()
+#   #
+#   # with open('output-B_lst.txt', 'w') as fw:
+#   #   for line in B_lst:
+#   #     fw.write('{}\n'.format(line))
+#
+#   # with open('output-B_2nd_round.txt', 'w') as fw:
+#   #   for line in B_2nd_round:
+#   #     fw.write('{}\n'.format(line))
+#   #
+#   # with open('output-B_3rd_round.txt', 'w') as fw:
+#   #   for line in B_3rd_round:
+#   #     fw.write('{}\n'.format(line))
+#
+#   # # test AutoPhrase.PGPS
+#   # fname_corpus = 'data/test.xlsx'
+#   # corpus_instance = Corpus(fname_corpus)
+#   # quality_instance = Quality('data/QualityPhrase（新能源2017年）.xlsx')
+#   # omega_instance = Omega(corpus_instance)
+#   # ap = AutoPhrase(omega=omega_instance,
+#   #                 quality=quality_instance,
+#   #                 length_threshold=6)
+#   # ap.init_parameters(memory_size_mb=128)
+#   # res = ap.PGPS()
+#   #
+#   # with open('output-G.txt', 'w') as fw:
+#   #   for line in res:
+#   #     fw.write('{}\n'.format(line))
+#
+#   # # test Ngram
+#   # corpus = Corpus('data/test.xlsx')
+#   # bigram = Ngram(corpus, n=2, ignore_unigram=True)
+#   # for i in bigram:
+#   #   print(i)
+#   #
+#   #
+#   # # test Quality implemented by trie tree
+#   # trie = Quality('data/QualityPhrase（新能源2017年）.xlsx')
+#   # # assert '插 电 式 混合' in trie
+#   # # assert '插 电 式 混合 动力 城市' in trie
+#   # # assert '插 电 式 混合 动' not in trie
+#   # print(trie['插 电 式 混合'])
+#   # print(trie['插 电 式 混合 动力 城市'])
+#   # print(trie.startswith('插'))
+#   # ipsh()
+#   #
+#   #
+#   # # test Omega
+#   # corpus = Corpus('data/test.xlsx')
+#   # omega = Omega(corpus)
+#   # assert omega.word(0, 15) == ' '.join(t.word for t in omega[:15])
+#   # assert omega.tag(0, 15) == ' '.join(t.tag for t in omega[:15])
